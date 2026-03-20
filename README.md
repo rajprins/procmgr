@@ -2,6 +2,18 @@
 
 **Procmgr** is an interactive CLI for managing processes on MacOS.
 
+<img width="927" height="574" alt="Image" src="https://github.com/user-attachments/assets/70db375b-e1d6-488e-8098-036052a4a420" />
+
+## Features
+procmgr allows you to:
+
+- List processes and their memory usage
+- Sort the process list by name (A-Z, Z-A) or memory usage (high-low, low-high)
+- Search for processes
+- Terminate one or more selected processes
+- Navigate using keyboard
+
+
 ## Prequisites
 
 If you wish to build `procmgr` from source, make sure you have:
@@ -22,7 +34,7 @@ cd procmgr
 
 ### Get dependencies
 
-This cleans and updates go.mod and go.sum by ensuring they reflect the actual dependencies required by the code.
+This cleans and updates `go.mod` and `go.sum` by ensuring they reflect the actual dependencies required by the code.
 
 ```bash
 go mod tidy
