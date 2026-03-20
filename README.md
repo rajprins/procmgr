@@ -54,6 +54,18 @@ Optionally, install the `procmgr` binary to ${GOPATH}/bin:
 go install
 ```
 
+## Screenshots  
+
+Searching using `/`  
+<img width="927" height="574" alt="Image" src="https://github.com/user-attachments/assets/76e4ada4-d1e7-4852-81cb-c63840a9b1ec" />
+
+Selecting multiple processes  
+<img width="927" height="574" alt="Image" src="https://github.com/user-attachments/assets/0c08f75f-1b40-4fb3-b0da-a3054d28e79f" />
+
+Terminating multiple processes  
+<img width="927" height="574" alt="Image" src="https://github.com/user-attachments/assets/0c08f75f-1b40-4fb3-b0da-a3054d28e79f" />
+
+
 ## Use of third-party packages
 
 Procmgr depends on the following packages:  
