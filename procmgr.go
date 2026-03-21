@@ -343,14 +343,12 @@ func (tui *tui) draw() {
 			return ""
 		}
 		if tui.sortDesc {
-			return " v"
+			return " ↓"
 		}
-		return " ^"
+		return " ↑"
 	}
 	header := fmt.Sprintf("      %-*s  %s  %s",
-		nw, "NAME"+sortArrow(sortByName),
-		lpad("PID", pidCols),
-		lpad("MEMORY"+sortArrow(sortByMem), memCols),
+		nw, "NAME"+sortArrow(sortByName), lpad("PID", pidCols), lpad("MEMORY"+sortArrow(sortByMem), memCols),
 	)
 	stringBuilder.WriteString(ansiBold + ansiDim + rpad(header, tui.width) + ansiReset + "\r\n")
 
@@ -530,7 +528,8 @@ func (tui *tui) handleSearchKey(key string) bool {
 		tui.mode = modeNormal
 	case "backspace":
 		if len(tui.search) > 0 {
-			tui.search = tui.search[:len(tui.search)-1]
+			r := []rune(tui.search)
+			tui.search = string(r[:len(r)-1])
 			tui.refilter()
 		}
 	default:
@@ -555,7 +554,10 @@ func (tui *tui) handleConfirmKey(key string) bool {
 			}
 		}
 		tui.selected = make(map[int]bool)
-		tui.reload()
+		if err := tui.reload(); err != nil {
+			tui.message = "Reload error: " + err.Error()
+			return false
+		}
 		tui.message = fmt.Sprintf("Killed %d process(es)", killed)
 		if failed > 0 {
 			tui.message += fmt.Sprintf(", %d failed (permission denied?)", failed)
@@ -582,11 +584,7 @@ func (tui *tui) toggleCursor() {
 }
 
 func killPID(pid int) error {
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return err
-	}
-	return p.Kill()
+	return unix.Kill(pid, unix.SIGKILL)
 }
 
 // ── Key reading ───────────────────────────────────────────────────────────────
@@ -665,21 +663,23 @@ func (tui *tui) readEscSeq() string {
 
 // rpad right-pads (or truncates) s to exactly n bytes.
 func rpad(s string, n int) string {
-	if len(s) >= n {
-		return s[:n]
+	runes := []rune(s)
+	if len(runes) >= n {
+		return string(runes[:n])
 	}
-	return s + strings.Repeat(" ", n-len(s))
+	return s + strings.Repeat(" ", n-len(runes))
 }
 
-// lpad left-pads s to at least n bytes.
+// lpad left-pads s to at least n runes wide.
 func lpad(s string, n int) string {
-	if len(s) >= n {
+	w := utf8.RuneCountInString(s)
+	if w >= n {
 		return s
 	}
-	return strings.Repeat(" ", n-len(s)) + s
+	return strings.Repeat(" ", n-w) + s
 }
 
-// trunc truncates s to n bytes, adding "…" if it was longer.
+// trunc truncates s to n bytes, adding "..." if it was longer.
 func trunc(s string, n int) string {
 	if n <= 0 {
 		return ""
