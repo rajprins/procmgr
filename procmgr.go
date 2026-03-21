@@ -11,24 +11,25 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
-	ps "github.com/mitchellh/go-ps"
-	"github.com/olekukonko/ts"
 	"golang.org/x/sys/unix"
 )
 
 // ── ANSI escape codes ─────────────────────────────────────────────────────────
 
 const (
-	ansiReset  = "\x1b[0m"
-	ansiBold   = "\x1b[1m"
-	ansiDim    = "\x1b[2m"
-	ansiRev    = "\x1b[7m"
-	fgRed      = "\x1b[31m"
-	fgGreen    = "\x1b[32m"
-	fgYellow   = "\x1b[33m"
-	fgCyan     = "\x1b[36m"
-	bgDarkBlue = "\x1b[48;5;17m"
+	ansiReset   = "\x1b[0m"
+	ansiBold    = "\x1b[1m"
+	ansiDim     = "\x1b[2m"
+	ansiRev     = "\x1b[7m"
+	fgRed       = "\x1b[91m"
+	fgGreen     = "\x1b[92m"
+	fgYellow    = "\x1b[93m"
+	fgBlue      = "\x1b[94m"
+	fgMagenta   = "\x1b[95m"
+	fgCyan      = "\x1b[96m"
+	bgDarkBlue  = "\x1b[48;5;17m"
 	bgDarkGreen = "\x1b[48;5;22m"
 )
 
@@ -43,7 +44,7 @@ type process struct {
 type uiMode int
 
 const (
-	modeNormal  uiMode = iota
+	modeNormal uiMode = iota
 	modeSearch
 	modeConfirm
 )
@@ -51,7 +52,7 @@ const (
 type sortField int
 
 const (
-	sortByMem  sortField = iota
+	sortByMem sortField = iota
 	sortByName
 )
 
@@ -69,6 +70,7 @@ type tui struct {
 	message  string
 	sortBy   sortField
 	sortDesc bool
+	showAll  bool // true = all users, false = current user only
 
 	width  int
 	height int
@@ -80,28 +82,29 @@ type tui struct {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 func main() {
-	t := &tui{
+	tui := &tui{
 		selected: make(map[int]bool),
 		in:       bufio.NewReaderSize(os.Stdin, 64),
 		sortBy:   sortByMem,
 		sortDesc: true,
+		showAll:  false,
 	}
 
-	if err := t.initTerm(); err != nil {
+	if err := tui.initTerm(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	defer t.cleanupTerm()
+	defer tui.cleanupTerm()
 
-	if err := t.reload(); err != nil {
-		t.cleanupTerm()
+	if err := tui.reload(); err != nil {
+		tui.cleanupTerm()
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
 	for {
-		t.draw()
-		if t.handleInput() {
+		tui.draw()
+		if tui.handleInput() {
 			return
 		}
 	}
@@ -109,12 +112,12 @@ func main() {
 
 // ── Terminal management ───────────────────────────────────────────────────────
 
-func (t *tui) initTerm() error {
+func (tui *tui) initTerm() error {
 	orig, err := unix.IoctlGetTermios(int(os.Stdin.Fd()), unix.TIOCGETA)
 	if err != nil {
 		return fmt.Errorf("get termios: %w", err)
 	}
-	t.orig = *orig
+	tui.orig = *orig
 
 	raw := *orig
 	// Disable echo, canonical mode, signals, and extended processing.
@@ -134,48 +137,66 @@ func (t *tui) initTerm() error {
 	return nil
 }
 
-func (t *tui) cleanupTerm() {
+func (tui *tui) cleanupTerm() {
 	fmt.Print("\x1b[?25h\x1b[2J\x1b[H") // show cursor + clear screen
-	unix.IoctlSetTermios(int(os.Stdin.Fd()), unix.TIOCSETA, &t.orig)
+	unix.IoctlSetTermios(int(os.Stdin.Fd()), unix.TIOCSETA, &tui.orig)
 }
 
 // ── Data loading ──────────────────────────────────────────────────────────────
 
-func (t *tui) reload() error {
-	psList, err := ps.Processes()
+func (tui *tui) reload() error {
+	procs, err := listProcs(tui.showAll)
 	if err != nil {
 		return fmt.Errorf("list processes: %w", err)
 	}
-
-	mem := fetchMem()
-
-	seen := make(map[int]bool)
-	procs := make([]process, 0, len(psList))
-	for _, p := range psList {
-		if seen[p.Pid()] {
-			continue
-		}
-		seen[p.Pid()] = true
-		procs = append(procs, process{
-			name:  fullName(p.Pid(), p.Executable()),
-			pid:   p.Pid(),
-			memKB: mem[p.Pid()],
-		})
-	}
-
-	t.procs = procs
-	t.sortProcs()
-	t.refilter()
-	t.message = fmt.Sprintf("Loaded %d processes", len(procs))
+	tui.procs = procs
+	tui.sortProcs()
+	tui.refilter()
+	tui.message = fmt.Sprintf("Loaded %d processes", len(procs))
 	return nil
 }
 
-// sortProcs sorts t.procs according to t.sortBy and t.sortDesc.
-func (t *tui) sortProcs() {
-	sort.SliceStable(t.procs, func(i, j int) bool {
-		pi, pj := t.procs[i], t.procs[j]
+// listProcs lists all running processes with their PID, name, and RSS memory
+// using a single invocation of the system ps(1) command.
+func listProcs(showAll bool) ([]process, error) {
+	psArgs := "-x"
+	if showAll {
+		psArgs = "-ax"
+	}
+	out, err := exec.Command("ps", psArgs, "-o", "pid=,rss=,comm=").Output()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[int]bool)
+	var procs []process
+	sc := bufio.NewScanner(bytes.NewReader(out))
+	for sc.Scan() {
+		f := strings.Fields(sc.Text())
+		if len(f) < 3 {
+			continue
+		}
+		pid, err := strconv.Atoi(f[0])
+		if err != nil || seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		rss, _ := strconv.ParseInt(f[1], 10, 64)
+		comm := strings.Join(f[2:], " ")
+		procs = append(procs, process{
+			name:  fullName(pid, comm),
+			pid:   pid,
+			memKB: rss,
+		})
+	}
+	return procs, nil
+}
+
+// sortProcs sorts tui.procs according to tui.sortBy and tui.sortDesc.
+func (tui *tui) sortProcs() {
+	sort.SliceStable(tui.procs, func(i, j int) bool {
+		pi, pj := tui.procs[i], tui.procs[j]
 		var less bool
-		switch t.sortBy {
+		switch tui.sortBy {
 		case sortByName:
 			ni, nj := strings.ToLower(pi.name), strings.ToLower(pj.name)
 			if ni != nj {
@@ -190,33 +211,11 @@ func (t *tui) sortProcs() {
 				less = strings.ToLower(pi.name) < strings.ToLower(pj.name)
 			}
 		}
-		if t.sortDesc {
+		if tui.sortDesc {
 			return !less
 		}
 		return less
 	})
-}
-
-// fetchMem returns a pid→RSS(KB) map using the system `ps` command.
-func fetchMem() map[int]int64 {
-	out, err := exec.Command("ps", "-ax", "-o", "pid=,rss=").Output()
-	if err != nil {
-		return nil
-	}
-	m := make(map[int]int64)
-	sc := bufio.NewScanner(bytes.NewReader(out))
-	for sc.Scan() {
-		f := strings.Fields(sc.Text())
-		if len(f) < 2 {
-			continue
-		}
-		pid, e1 := strconv.Atoi(f[0])
-		rss, e2 := strconv.ParseInt(f[1], 10, 64)
-		if e1 == nil && e2 == nil {
-			m[pid] = rss
-		}
-	}
-	return m
 }
 
 // fullName returns the untruncated executable name via kern.procargs2 on macOS,
@@ -237,19 +236,19 @@ func fullName(pid int, fallback string) string {
 	return fallback
 }
 
-// refilter rebuilds t.filtered from the current search string and clamps cursor.
-func (t *tui) refilter() {
-	q := strings.ToLower(t.search)
-	t.filtered = t.filtered[:0]
-	for i, p := range t.procs {
+// refilter rebuilds tui.filtered from the current search string and clamps cursor.
+func (tui *tui) refilter() {
+	q := strings.ToLower(tui.search)
+	tui.filtered = tui.filtered[:0]
+	for i, p := range tui.procs {
 		if q == "" ||
 			strings.Contains(strings.ToLower(p.name), q) ||
 			strings.Contains(strconv.Itoa(p.pid), q) {
-			t.filtered = append(t.filtered, i)
+			tui.filtered = append(tui.filtered, i)
 		}
 	}
-	if t.cursor >= len(t.filtered) {
-		t.cursor = max(0, len(t.filtered)-1)
+	if tui.cursor >= len(tui.filtered) {
+		tui.cursor = max(0, len(tui.filtered)-1)
 	}
 }
 
@@ -269,67 +268,81 @@ const (
 	memCols   = 9
 )
 
-func (t *tui) updateSize() {
-	t.width, t.height = 80, 24
-	if sz, err := ts.GetSize(); err == nil && sz.Col() > 0 {
-		t.width = sz.Col()
-		t.height = sz.Row()
+func (tui *tui) updateSize() {
+	tui.width, tui.height = 80, 24
+	if ws, err := unix.IoctlGetWinsize(int(os.Stdout.Fd()), unix.TIOCGWINSZ); err == nil && ws.Col > 0 {
+		tui.width = int(ws.Col)
+		tui.height = int(ws.Row)
 	}
 }
 
-func (t *tui) nameWidth() int {
-	n := t.width - fixedCols
+func (tui *tui) nameWidth() int {
+	n := tui.width - fixedCols
 	if n < 20 {
 		return 20
 	}
 	return n
 }
 
-// listRows returns the number of visible process rows.
-// Layout: title(1) + colheader(1) + sep(1) + list(n) + sep(1) + statusbar(1) = height
-func (t *tui) listRows() int {
-	h := t.height - 5
-	if h < 1 {
-		return 1
+// statusBarText returns the plain (no ANSI) text for the status bar.
+func (tui *tui) statusBarText(selCount int) string {
+	switch tui.mode {
+	case modeSearch:
+		return "Search: " + tui.search + "█"
+	case modeConfirm:
+		return fmt.Sprintf("Kill %d process(es)? [y/N]: ", selCount)
+	default:
+		if tui.message != "" {
+			return tui.message
+		}
+		return "↑↓: move | spc: select | a: all | A: none | k: kill | /: search | n: sort name | m: sort mem | u: user/all | r: reload | q: quit"
 	}
-	return h
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
-func (t *tui) draw() {
-	t.updateSize()
-	nw := t.nameWidth()
-	lh := t.listRows()
+func (tui *tui) draw() {
+	tui.updateSize()
+	nw := tui.nameWidth()
+
+	// Compute status bar height first so the list height accounts for wrapping.
+	selCount := len(tui.selected)
+	statusTxt := tui.statusBarText(selCount)
+	statusLines := max(1, (utf8.RuneCountInString(statusTxt)+tui.width-1)/tui.width)
+	// Layout: title(1) + colheader(1) + sep(1) + list(lh) + sep(1) + status(statusLines) = height
+	lh := max(1, tui.height-4-statusLines)
 
 	// Keep cursor visible within the scroll window.
-	if t.cursor < t.offset {
-		t.offset = t.cursor
+	if tui.cursor < tui.offset {
+		tui.offset = tui.cursor
 	}
-	if t.cursor >= t.offset+lh {
-		t.offset = t.cursor - lh + 1
+	if tui.cursor >= tui.offset+lh {
+		tui.offset = tui.cursor - lh + 1
 	}
 
-	var b strings.Builder
-	b.WriteString("\x1b[2J\x1b[H") // clear screen and home cursor
+	var stringBuilder strings.Builder
+	stringBuilder.WriteString("\x1b[2J\x1b[H") // clear screen and home cursor
 
 	// ── Title bar ─────────────────────────────────────────────────────────
-	selCount := len(t.selected)
-	info := fmt.Sprintf(" procmgr  %d processes", len(t.procs))
-	if t.search != "" {
-		info += fmt.Sprintf("  filter:\"%s\" (%d)", t.search, len(t.filtered))
+	scope := "all"
+	if !tui.showAll {
+		scope = "user"
+	}
+	info := fmt.Sprintf("procmgr | %d processes (%s)", len(tui.procs), scope)
+	if tui.search != "" {
+		info += fmt.Sprintf(" | filter:\"%s\" (%d)", tui.search, len(tui.filtered))
 	}
 	if selCount > 0 {
-		info += fmt.Sprintf("  [%d selected]", selCount)
+		info += fmt.Sprintf(" | %d selected", selCount)
 	}
-	b.WriteString(ansiRev + ansiBold + rpad(info, t.width) + ansiReset + "\r\n")
+	stringBuilder.WriteString(ansiRev + ansiBold + rpad(info, tui.width) + ansiReset + "\r\n")
 
 	// ── Column header ──────────────────────────────────────────────────────
 	sortArrow := func(field sortField) string {
-		if t.sortBy != field {
+		if tui.sortBy != field {
 			return ""
 		}
-		if t.sortDesc {
+		if tui.sortDesc {
 			return " v"
 		}
 		return " ^"
@@ -339,23 +352,23 @@ func (t *tui) draw() {
 		lpad("PID", pidCols),
 		lpad("MEMORY"+sortArrow(sortByMem), memCols),
 	)
-	b.WriteString(ansiBold + ansiDim + rpad(header, t.width) + ansiReset + "\r\n")
+	stringBuilder.WriteString(ansiBold + ansiDim + rpad(header, tui.width) + ansiReset + "\r\n")
 
 	// ── Top separator ─────────────────────────────────────────────────────
-	b.WriteString(ansiDim + strings.Repeat("─", t.width) + ansiReset + "\r\n")
+	stringBuilder.WriteString(ansiDim + strings.Repeat("─", tui.width) + ansiReset + "\r\n")
 
 	// ── Process rows ──────────────────────────────────────────────────────
 	for row := range lh {
-		idx := t.offset + row
-		if idx >= len(t.filtered) {
-			b.WriteString("\r\n")
+		idx := tui.offset + row
+		if idx >= len(tui.filtered) {
+			stringBuilder.WriteString("\r\n")
 			continue
 		}
 
-		pi := t.filtered[idx]
-		p := t.procs[pi]
-		isCursor := idx == t.cursor
-		isSel := t.selected[p.pid]
+		pi := tui.filtered[idx]
+		p := tui.procs[pi]
+		isCursor := idx == tui.cursor
+		isSel := tui.selected[p.pid]
 
 		check := "[ ]"
 		if isSel {
@@ -369,197 +382,202 @@ func (t *tui) draw() {
 		name := trunc(p.name, nw)
 		pidStr := lpad(strconv.Itoa(p.pid), pidCols)
 		memStr := lpad(fmtMem(p.memKB), memCols)
-		content := fmt.Sprintf("%s%s %-*s  %s  %s",
-			marker, check, nw, name, pidStr, memStr)
-		line := rpad(content, t.width)
+		content := fmt.Sprintf("%s%s %-*s  %s  %s", marker, check, nw, name, pidStr, memStr)
+		line := rpad(content, tui.width)
 
 		switch {
 		case isCursor && isSel:
-			b.WriteString(bgDarkGreen + fgYellow + ansiBold + line + ansiReset)
+			stringBuilder.WriteString(bgDarkGreen + fgYellow + ansiBold + line + ansiReset)
 		case isCursor:
-			b.WriteString(bgDarkBlue + fgCyan + line + ansiReset)
+			stringBuilder.WriteString(bgDarkBlue + fgCyan + line + ansiReset)
 		case isSel:
-			b.WriteString(fgGreen + line + ansiReset)
+			stringBuilder.WriteString(fgGreen + line + ansiReset)
 		default:
-			b.WriteString(line)
+			stringBuilder.WriteString(line)
 		}
-		b.WriteString("\r\n")
+		stringBuilder.WriteString("\r\n")
 	}
 
 	// ── Bottom separator ──────────────────────────────────────────────────
-	b.WriteString(ansiDim + strings.Repeat("─", t.width) + ansiReset + "\r\n")
+	stringBuilder.WriteString(ansiDim + strings.Repeat("─", tui.width) + ansiReset + "\r\n")
 
 	// ── Status / help bar ─────────────────────────────────────────────────
-	switch t.mode {
+	switch tui.mode {
 	case modeSearch:
-		b.WriteString(fgCyan + "Search: " + ansiReset + t.search + "█")
+		stringBuilder.WriteString(fgCyan + "Search: " + ansiReset + tui.search + "█")
 	case modeConfirm:
-		b.WriteString(fgRed + ansiBold +
-			fmt.Sprintf("Kill %d process(es)? [y/N]: ", selCount) +
-			ansiReset)
+		stringBuilder.WriteString(fgRed + ansiBold + statusTxt + ansiReset)
 	default:
-		if t.message != "" {
-			b.WriteString(fgGreen + t.message + ansiReset)
+		if tui.message != "" {
+			stringBuilder.WriteString(fgGreen + statusTxt + ansiReset)
 		} else {
-			b.WriteString(ansiDim +
-				"↑↓: move  spc: select  a: all  A: none  k: kill  /: search  n: sort name  m: sort mem  r: reload  q: quit" +
-				ansiReset)
+			stringBuilder.WriteString(fgCyan + statusTxt + ansiReset)
 		}
 	}
 
-	fmt.Print(b.String())
+	fmt.Print(stringBuilder.String())
 }
 
 // ── Input handling ────────────────────────────────────────────────────────────
 
 // handleInput reads one keypress and dispatches it. Returns true to quit.
-func (t *tui) handleInput() (quit bool) {
-	key := t.readKey()
-	t.message = "" // clear transient message on any keypress
+func (tui *tui) handleInput() (quit bool) {
+	key := tui.readKey()
+	tui.message = "" // clear transient message on any keypress
 
-	switch t.mode {
+	switch tui.mode {
 	case modeSearch:
-		return t.handleSearchKey(key)
+		return tui.handleSearchKey(key)
 	case modeConfirm:
-		return t.handleConfirmKey(key)
+		return tui.handleConfirmKey(key)
 	default:
-		return t.handleNormalKey(key)
+		return tui.handleNormalKey(key)
 	}
 }
 
-func (t *tui) handleNormalKey(key string) bool {
+func (tui *tui) handleNormalKey(key string) bool {
 	switch key {
 	case "q", "ctrl+c", "ctrl+d":
 		return true
 
 	case "up":
-		if t.cursor > 0 {
-			t.cursor--
+		if tui.cursor > 0 {
+			tui.cursor--
 		}
 	case "down":
-		if t.cursor < len(t.filtered)-1 {
-			t.cursor++
+		if tui.cursor < len(tui.filtered)-1 {
+			tui.cursor++
 		}
 
 	case " ":
-		t.toggleCursor()
+		tui.toggleCursor()
 
 	case "a":
-		for _, i := range t.filtered {
-			t.selected[t.procs[i].pid] = true
+		for _, i := range tui.filtered {
+			tui.selected[tui.procs[i].pid] = true
 		}
-		t.message = fmt.Sprintf("Selected all %d visible processes", len(t.filtered))
+		tui.message = fmt.Sprintf("Selected all %d visible processes", len(tui.filtered))
 
 	case "A", "esc":
-		t.selected = make(map[int]bool)
-		t.search = ""
-		t.refilter()
-		t.message = "Selection and filter cleared"
+		tui.selected = make(map[int]bool)
+		tui.search = ""
+		tui.refilter()
+		tui.message = "Selection and filter cleared"
 
 	case "k":
-		if len(t.selected) == 0 {
-			t.message = "Nothing selected — use Space to select processes"
+		if len(tui.selected) == 0 {
+			tui.message = "Nothing selected — use Space to select processes"
 		} else {
-			t.mode = modeConfirm
+			tui.mode = modeConfirm
 		}
 
 	case "/":
-		t.mode = modeSearch
+		tui.mode = modeSearch
 
 	case "n":
-		if t.sortBy == sortByName {
-			t.sortDesc = !t.sortDesc
+		if tui.sortBy == sortByName {
+			tui.sortDesc = !tui.sortDesc
 		} else {
-			t.sortBy = sortByName
-			t.sortDesc = false
+			tui.sortBy = sortByName
+			tui.sortDesc = false
 		}
-		t.sortProcs()
-		t.refilter()
-		if t.sortDesc {
-			t.message = "Sorted by name Z→A"
+		tui.sortProcs()
+		tui.refilter()
+		if tui.sortDesc {
+			tui.message = "Sorted by name Z→A"
 		} else {
-			t.message = "Sorted by name A→Z"
+			tui.message = "Sorted by name A→Z"
 		}
 
 	case "m":
-		if t.sortBy == sortByMem {
-			t.sortDesc = !t.sortDesc
+		if tui.sortBy == sortByMem {
+			tui.sortDesc = !tui.sortDesc
 		} else {
-			t.sortBy = sortByMem
-			t.sortDesc = true
+			tui.sortBy = sortByMem
+			tui.sortDesc = true
 		}
-		t.sortProcs()
-		t.refilter()
-		if t.sortDesc {
-			t.message = "Sorted by memory high→low"
+		tui.sortProcs()
+		tui.refilter()
+		if tui.sortDesc {
+			tui.message = "Sorted by memory high→low"
 		} else {
-			t.message = "Sorted by memory low→high"
+			tui.message = "Sorted by memory low→high"
 		}
 
 	case "r":
-		if err := t.reload(); err != nil {
-			t.message = "Reload error: " + err.Error()
+		if err := tui.reload(); err != nil {
+			tui.message = "Reload error: " + err.Error()
+		}
+
+	case "u":
+		tui.showAll = !tui.showAll
+		if err := tui.reload(); err != nil {
+			tui.message = "Reload error: " + err.Error()
+		} else if tui.showAll {
+			tui.message = "Showing all processes"
+		} else {
+			tui.message = "Showing user processes"
 		}
 	}
 	return false
 }
 
-func (t *tui) handleSearchKey(key string) bool {
+func (tui *tui) handleSearchKey(key string) bool {
 	switch key {
 	case "ctrl+c", "ctrl+d":
 		return true
 	case "esc", "enter":
-		t.mode = modeNormal
+		tui.mode = modeNormal
 	case "backspace":
-		if len(t.search) > 0 {
-			t.search = t.search[:len(t.search)-1]
-			t.refilter()
+		if len(tui.search) > 0 {
+			tui.search = tui.search[:len(tui.search)-1]
+			tui.refilter()
 		}
 	default:
 		if len(key) == 1 && key[0] >= 32 {
-			t.search += key
-			t.refilter()
+			tui.search += key
+			tui.refilter()
 		}
 	}
 	return false
 }
 
-func (t *tui) handleConfirmKey(key string) bool {
+func (tui *tui) handleConfirmKey(key string) bool {
 	switch key {
 	case "y", "Y":
-		t.mode = modeNormal
+		tui.mode = modeNormal
 		killed, failed := 0, 0
-		for pid := range t.selected {
+		for pid := range tui.selected {
 			if killPID(pid) == nil {
 				killed++
 			} else {
 				failed++
 			}
 		}
-		t.selected = make(map[int]bool)
-		t.reload()
-		t.message = fmt.Sprintf("Killed %d process(es)", killed)
+		tui.selected = make(map[int]bool)
+		tui.reload()
+		tui.message = fmt.Sprintf("Killed %d process(es)", killed)
 		if failed > 0 {
-			t.message += fmt.Sprintf(", %d failed (permission denied?)", failed)
+			tui.message += fmt.Sprintf(", %d failed (permission denied?)", failed)
 		}
 	case "n", "N", "esc", "enter", "q":
-		t.mode = modeNormal
-		t.message = "Kill cancelled"
+		tui.mode = modeNormal
+		tui.message = "Kill cancelled"
 	case "ctrl+c", "ctrl+d":
 		return true
 	}
 	return false
 }
 
-func (t *tui) toggleCursor() {
-	if len(t.filtered) == 0 {
+func (tui *tui) toggleCursor() {
+	if len(tui.filtered) == 0 {
 		return
 	}
-	pid := t.procs[t.filtered[t.cursor]].pid
-	if t.selected[pid] {
-		delete(t.selected, pid)
+	pid := tui.procs[tui.filtered[tui.cursor]].pid
+	if tui.selected[pid] {
+		delete(tui.selected, pid)
 	} else {
-		t.selected[pid] = true
+		tui.selected[pid] = true
 	}
 }
 
@@ -573,8 +591,8 @@ func killPID(pid int) error {
 
 // ── Key reading ───────────────────────────────────────────────────────────────
 
-func (t *tui) readKey() string {
-	b, err := t.in.ReadByte()
+func (tui *tui) readKey() string {
+	b, err := tui.in.ReadByte()
 	if err != nil {
 		return "ctrl+d"
 	}
@@ -584,7 +602,7 @@ func (t *tui) readKey() string {
 	case 4:
 		return "ctrl+d"
 	case 27: // ESC or ANSI escape sequence
-		seq := t.readEscSeq()
+		seq := tui.readEscSeq()
 		switch seq {
 		case "[A":
 			return "up"
@@ -609,7 +627,7 @@ func (t *tui) readKey() string {
 // readEscSeq reads the bytes following ESC. It temporarily switches the
 // terminal to VMIN=0, VTIME=1 (100 ms timeout) so that bare ESC and
 // multi-byte escape sequences are both handled correctly.
-func (t *tui) readEscSeq() string {
+func (tui *tui) readEscSeq() string {
 	cur, err := unix.IoctlGetTermios(int(os.Stdin.Fd()), unix.TIOCGETA)
 	if err != nil {
 		return ""
@@ -627,7 +645,7 @@ func (t *tui) readEscSeq() string {
 
 	var seq []byte
 	for range 5 {
-		b, err := t.in.ReadByte()
+		b, err := tui.in.ReadByte()
 		if err != nil {
 			break
 		}
@@ -689,4 +707,3 @@ func fmtMem(kb int64) string {
 	}
 	return fmt.Sprintf("%.2f GB", mb/1024.0)
 }
-
