@@ -13,14 +13,32 @@ procmgr allows you to:
 - Navigate using keyboard
 
 
-## Prequisites
+## Usage
+Start procmgr from command line using the `procmgr` command.
+
+Keyboard navigation:
+- UP, DOWN: Go up or down in the process list
+- SPACE: select the highlighted process
+- a: select ALL processes
+- A: select NONE (undo selection)
+- k: terminate (kill) selected process(ses)
+- /: search/filter
+- n: sort process list by name; toggle A-Z, Z-A
+- m: sort process list by memory; toggle high-low, low-high
+- u: switch between user processes and all processes
+- r: reload process list (this is not done automatically!)
+- q: quit procmgr
+
+
+## Build instructions
+
+### Prequisites
 
 If you wish to build `procmgr` from source, make sure you have:
 
 - [Go](https://go.dev/dl/) version `1.25` or higher installed.
 - An active internet connection (required for downloading dependencies)
 
-## Build instructions
 
 ### Get the code
 
