@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
@@ -26,8 +27,6 @@ const (
 	fgRed       = "\x1b[91m"
 	fgGreen     = "\x1b[92m"
 	fgYellow    = "\x1b[93m"
-	fgBlue      = "\x1b[94m"
-	fgMagenta   = "\x1b[95m"
 	fgCyan      = "\x1b[96m"
 	bgDarkBlue  = "\x1b[48;5;17m"
 	bgDarkGreen = "\x1b[48;5;22m"
@@ -91,21 +90,62 @@ func main() {
 	}
 
 	if err := tui.initTerm(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		_, err := fmt.Fprintln(os.Stderr, err)
+		if err != nil {
+			return
+		}
 		os.Exit(1)
 	}
 	defer tui.cleanupTerm()
 
-	if err := tui.reload(); err != nil {
+	if err := tui.reload(false); err != nil {
 		tui.cleanupTerm()
-		fmt.Fprintln(os.Stderr, err)
+		_, err := fmt.Fprintln(os.Stderr, err)
+		if err != nil {
+			return
+		}
 		os.Exit(1)
 	}
 
+	// Start auto-reload ticker (every updateInterval)
+	ticker := time.NewTicker(updateInterval)
+	defer ticker.Stop()
+
+	// Channel for non-blocking input handling
+	inputChan := make(chan string)
+	go func() {
+		for {
+			inputChan <- tui.readKey()
+		}
+	}()
+
 	for {
 		tui.draw()
-		if tui.handleInput() {
-			return
+		// Clear transient message after displaying it
+		tui.message = ""
+
+		select {
+		case key := <-inputChan:
+			switch tui.mode {
+			case modeSearch:
+				if tui.handleSearchKey(key) {
+					return
+				}
+			case modeConfirm:
+				if tui.handleConfirmKey(key) {
+					return
+				}
+			default:
+				if tui.handleNormalKey(key) {
+					return
+				}
+			}
+
+		case <-ticker.C:
+			// Auto-reload process list every second (silently)
+			if err := tui.reload(true); err != nil {
+				tui.message = fmt.Sprintf("Auto-reload error: %v", err)
+			}
 		}
 	}
 }
@@ -139,21 +179,41 @@ func (tui *tui) initTerm() error {
 
 func (tui *tui) cleanupTerm() {
 	fmt.Print("\x1b[?25h\x1b[2J\x1b[H") // show cursor + clear screen
-	unix.IoctlSetTermios(int(os.Stdin.Fd()), unix.TIOCSETA, &tui.orig)
+	err := unix.IoctlSetTermios(int(os.Stdin.Fd()), unix.TIOCSETA, &tui.orig)
+	if err != nil {
+		return
+	}
 }
 
 // ── Data loading ──────────────────────────────────────────────────────────────
 
-func (tui *tui) reload() error {
+func (tui *tui) reload(silent bool) error {
 	procs, err := listProcs(tui.showAll)
 	if err != nil {
 		return fmt.Errorf("list processes: %w", err)
 	}
 	tui.procs = procs
+	tui.cleanupSelected() // Remove selections for processes that no longer exist
 	tui.sortProcs()
 	tui.refilter()
-	tui.message = fmt.Sprintf("Loaded %d processes", len(procs))
+	if !silent {
+		tui.message = fmt.Sprintf("Loaded %d processes", len(procs))
+	}
 	return nil
+}
+
+// cleanupSelected removes selections for PIDs that are no longer in the process list.
+// This prevents accumulating selections for terminated processes.
+func (tui *tui) cleanupSelected() {
+	validPIDs := make(map[int]bool)
+	for _, p := range tui.procs {
+		validPIDs[p.pid] = true
+	}
+	for pid := range tui.selected {
+		if !validPIDs[pid] {
+			delete(tui.selected, pid)
+		}
+	}
 }
 
 // listProcs lists all running processes with their PID, name, and RSS memory
@@ -263,9 +323,10 @@ const (
 	//   gap:     2  between PID and memory
 	//   mem:     9  right-aligned
 	//   total fixed = 2+4+2+7+2+9 = 26
-	fixedCols = 26
-	pidCols   = 7
-	memCols   = 9
+	fixedCols      = 26
+	pidCols        = 7
+	memCols        = 9
+	updateInterval = time.Second
 )
 
 func (tui *tui) updateSize() {
@@ -295,7 +356,7 @@ func (tui *tui) statusBarText(selCount int) string {
 		if tui.message != "" {
 			return tui.message
 		}
-		return "↑↓: move | spc: select | a: all | A: none | k: kill | /: search | n: sort name | m: sort mem | u: user/all | r: reload | q: quit"
+		return "↑↓: move | spc: select | a: all | A: none | k: kill | /: search | n: sort name | m: sort mem | u: user/all | q: quit"
 	}
 }
 
@@ -328,7 +389,7 @@ func (tui *tui) draw() {
 	if !tui.showAll {
 		scope = "user"
 	}
-	info := fmt.Sprintf("procmgr | %d processes (%s)", len(tui.procs), scope)
+	info := fmt.Sprintf("procmgr | %d processes (%s) | auto-refresh: %v", len(tui.procs), scope, updateInterval)
 	if tui.search != "" {
 		info += fmt.Sprintf(" | filter:\"%s\" (%d)", tui.search, len(tui.filtered))
 	}
@@ -418,21 +479,6 @@ func (tui *tui) draw() {
 
 // ── Input handling ────────────────────────────────────────────────────────────
 
-// handleInput reads one keypress and dispatches it. Returns true to quit.
-func (tui *tui) handleInput() (quit bool) {
-	key := tui.readKey()
-	tui.message = "" // clear transient message on any keypress
-
-	switch tui.mode {
-	case modeSearch:
-		return tui.handleSearchKey(key)
-	case modeConfirm:
-		return tui.handleConfirmKey(key)
-	default:
-		return tui.handleNormalKey(key)
-	}
-}
-
 func (tui *tui) handleNormalKey(key string) bool {
 	switch key {
 	case "q", "ctrl+c", "ctrl+d":
@@ -502,14 +548,9 @@ func (tui *tui) handleNormalKey(key string) bool {
 			tui.message = "Sorted by memory low→high"
 		}
 
-	case "r":
-		if err := tui.reload(); err != nil {
-			tui.message = "Reload error: " + err.Error()
-		}
-
 	case "u":
 		tui.showAll = !tui.showAll
-		if err := tui.reload(); err != nil {
+		if err := tui.reload(false); err != nil {
 			tui.message = "Reload error: " + err.Error()
 		} else if tui.showAll {
 			tui.message = "Showing all processes"
@@ -554,7 +595,7 @@ func (tui *tui) handleConfirmKey(key string) bool {
 			}
 		}
 		tui.selected = make(map[int]bool)
-		if err := tui.reload(); err != nil {
+		if err := tui.reload(false); err != nil {
 			tui.message = "Reload error: " + err.Error()
 			return false
 		}
@@ -634,11 +675,17 @@ func (tui *tui) readEscSeq() string {
 	tmp := *cur
 	tmp.Cc[unix.VMIN] = 0
 	tmp.Cc[unix.VTIME] = 1
-	unix.IoctlSetTermios(int(os.Stdin.Fd()), unix.TIOCSETA, &tmp)
+	err = unix.IoctlSetTermios(int(os.Stdin.Fd()), unix.TIOCSETA, &tmp)
+	if err != nil {
+		return ""
+	}
 	defer func() {
 		cur.Cc[unix.VMIN] = 1
 		cur.Cc[unix.VTIME] = 0
-		unix.IoctlSetTermios(int(os.Stdin.Fd()), unix.TIOCSETA, cur)
+		err := unix.IoctlSetTermios(int(os.Stdin.Fd()), unix.TIOCSETA, cur)
+		if err != nil {
+			return
+		}
 	}()
 
 	var seq []byte
