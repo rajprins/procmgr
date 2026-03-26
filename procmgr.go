@@ -27,6 +27,7 @@ const (
 	fgRed       = "\x1b[91m"
 	fgGreen     = "\x1b[92m"
 	fgYellow    = "\x1b[93m"
+	fgMagenta   = "\x1b[95m"
 	fgCyan      = "\x1b[96m"
 	bgDarkBlue  = "\x1b[48;5;17m"
 	bgDarkGreen = "\x1b[48;5;22m"
@@ -51,7 +52,8 @@ const (
 type sortField int
 
 const (
-	sortByMem sortField = iota
+	sortByPID sortField = iota
+	sortByMem
 	sortByName
 )
 
@@ -90,20 +92,14 @@ func main() {
 	}
 
 	if err := tui.initTerm(); err != nil {
-		_, err := fmt.Fprintln(os.Stderr, err)
-		if err != nil {
-			return
-		}
+		_, _ = fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	defer tui.cleanupTerm()
 
 	if err := tui.reload(false); err != nil {
 		tui.cleanupTerm()
-		_, err := fmt.Fprintln(os.Stderr, err)
-		if err != nil {
-			return
-		}
+		_, _ = fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
@@ -257,6 +253,12 @@ func (tui *tui) sortProcs() {
 		pi, pj := tui.procs[i], tui.procs[j]
 		var less bool
 		switch tui.sortBy {
+		case sortByPID:
+			if pi.pid != pj.pid {
+				less = pi.pid < pj.pid
+			} else {
+				less = strings.ToLower(pi.name) < strings.ToLower(pj.name)
+			}
 		case sortByName:
 			ni, nj := strings.ToLower(pi.name), strings.ToLower(pj.name)
 			if ni != nj {
@@ -326,7 +328,7 @@ const (
 	fixedCols      = 26
 	pidCols        = 7
 	memCols        = 9
-	updateInterval = time.Second
+	updateInterval = 3 * time.Second
 )
 
 func (tui *tui) updateSize() {
@@ -347,6 +349,7 @@ func (tui *tui) nameWidth() int {
 
 // statusBarText returns the plain (no ANSI) text for the status bar.
 func (tui *tui) statusBarText(selCount int) string {
+	const KEYS = "↑↓: move | space: select | a: all | A: none | k: kill | /: search | n: sort name | m: sort mem | u: user/all | q: quit"
 	switch tui.mode {
 	case modeSearch:
 		return "Search: " + tui.search + "█"
@@ -356,7 +359,7 @@ func (tui *tui) statusBarText(selCount int) string {
 		if tui.message != "" {
 			return tui.message
 		}
-		return "↑↓: move | spc: select | a: all | A: none | k: kill | /: search | n: sort name | m: sort mem | u: user/all | q: quit"
+		return KEYS
 	}
 }
 
@@ -468,9 +471,11 @@ func (tui *tui) draw() {
 		stringBuilder.WriteString(fgRed + ansiBold + statusTxt + ansiReset)
 	default:
 		if tui.message != "" {
+			// Show messages (e.g. "Killed 3 processes") in green
 			stringBuilder.WriteString(fgGreen + statusTxt + ansiReset)
 		} else {
-			stringBuilder.WriteString(fgCyan + statusTxt + ansiReset)
+			// Show action keys (const KEYS) in magenta
+			stringBuilder.WriteString(fgMagenta + statusTxt + ansiReset)
 		}
 	}
 
@@ -708,13 +713,13 @@ func (tui *tui) readEscSeq() string {
 
 // ── String helpers ────────────────────────────────────────────────────────────
 
-// rpad right-pads (or truncates) s to exactly n bytes.
+// rpad right-pads (or truncates) s to exactly n runes.
 func rpad(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) >= n {
-		return string(runes[:n])
+	w := utf8.RuneCountInString(s)
+	if w >= n {
+		return string([]rune(s)[:n])
 	}
-	return s + strings.Repeat(" ", n-len(runes))
+	return s + strings.Repeat(" ", n-w)
 }
 
 // lpad left-pads s to at least n runes wide.
@@ -726,18 +731,19 @@ func lpad(s string, n int) string {
 	return strings.Repeat(" ", n-w) + s
 }
 
-// trunc truncates s to n bytes, adding "..." if it was longer.
+// trunc truncates s to n runes, adding "..." if it was longer.
 func trunc(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
 	if n <= 3 {
-		return s[:n]
+		return string(r[:n])
 	}
-	return s[:n-3] + "..."
+	return string(r[:n-3]) + "..."
 }
 
 // fmtMem formats a kilobyte value as a human-readable memory string.

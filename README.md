@@ -26,7 +26,6 @@ Keyboard navigation:
 - n: sort process list by name; toggle A-Z, Z-A
 - m: sort process list by memory; toggle high-low, low-high
 - u: switch between user processes and all processes
-- r: reload process list (this is not done automatically!)
 - q: quit procmgr
 
 
